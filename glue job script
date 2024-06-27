@@ -1,0 +1,109 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when, to_timestamp, unix_timestamp, from_unixtime, expr, date_format, concat_ws, lit,collect_list, first, array
+from pyspark.sql.types import TimestampType, LongType, IntegerType, StringType
+from pyspark.sql.window import Window
+
+
+# Initialize the Glue job
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 's3_path'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Load data from S3
+s3_path = args['s3_path']
+s3_data = spark.read.format("csv").option("header", "true").load(s3_path)
+
+# Mapping for LogLevel
+message_to_loglevel = {
+    'Crashes': 'FATAL',
+    'Data Corruption': 'FATAL',
+    'File I/O': 'DEBUG',
+    'Algorithm Steps': 'DEBUG',
+    'SQL Queries': 'DEBUG',
+    'Trace Information': 'DEBUG',
+    'Startup Messages': 'INFO',
+    'Status Updates': 'INFO',
+    'Critical Errors': 'ERROR',
+    'Database Errors': 'ERROR',
+    'Input Validation Warnings': 'WARNING',
+    'Performance Warnings': 'WARNING',
+    'Resource Warnings': 'WARNING'
+}
+
+# Broadcast the mapping
+broadcast_message_to_loglevel = sc.broadcast(message_to_loglevel)
+
+# UDF to fill LogLevel based on Message
+from pyspark.sql.functions import udf
+
+def fill_loglevel(message):
+    if message in broadcast_message_to_loglevel.value:
+        return broadcast_message_to_loglevel.value[message]
+    return None
+
+fill_loglevel_udf = udf(fill_loglevel, StringType())
+
+s3_data = s3_data.withColumn('LogLevel', when(col('LogLevel').isNull(), fill_loglevel_udf(col('Message'))).otherwise(col('LogLevel')))
+
+
+# Mapping for StatusCode
+loglevel_to_statuscode = {
+    'FATAL': 500,
+    'ERROR': 400,
+    'WARNING': 300,
+    'INFO': 200,
+    'DEBUG': 100
+}
+
+# Broadcast the mapping
+broadcast_loglevel_to_statuscode = sc.broadcast(loglevel_to_statuscode)
+
+# UDF to fill StatusCode based on LogLevel
+def fill_statuscode(loglevel):
+    if loglevel in broadcast_loglevel_to_statuscode.value:
+        return broadcast_loglevel_to_statuscode.value[loglevel]
+    return None
+
+fill_statuscode_udf = udf(fill_statuscode, StringType())
+
+s3_data = s3_data.withColumn('StatusCode', fill_statuscode_udf(col('LogLevel')))
+
+
+
+s3_data = s3_data \
+    .withColumn('Timestamp', to_timestamp(col('Timestamp'))) \
+    .withColumn('RequestID', col('RequestID').cast(LongType())) \
+    .withColumn('User', col('User').cast(StringType())) \
+    .withColumn('ClientIP', col('ClientIP').cast(StringType())) \
+    .withColumn('TimeTaken', col('TimeTaken').cast(IntegerType())) \
+    .withColumn('ProcessedTimestamp', to_timestamp(col('ProcessedTimestamp'))) \
+    .withColumn('StatusCode', col('StatusCode').cast(IntegerType())) \
+    .withColumnRenamed('User', 'Username') \
+    .withColumnRenamed('Message', 'Message_') \
+    .withColumn('LogLevel', col('LogLevel').cast(StringType())) \
+    .withColumn('Service', col('Service').cast(StringType()))
+    
+    
+
+# Write data to PostgreSQL
+postgres_url = "jdbc:postgresql://project-postgres1.cdyw8yqwifnn.eu-north-1.rds.amazonaws.com:5432/sampleDB"
+postgres_properties = {
+    "user": "postgres",
+    "password": "postgres123",
+    "driver": "org.postgresql.Driver"
+}
+
+s3_data.write.jdbc(url=postgres_url, table="service_logs", mode="append", properties=postgres_properties)
+
+# Commit the job
+job.commit()
+
